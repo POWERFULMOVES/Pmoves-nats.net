@@ -102,7 +102,7 @@ public partial class NatsConnection : INatsConnection
         _subscriptionManager = new SubscriptionManager(this, InboxPrefix);
         _replyTaskFactory = new ReplyTaskFactory(this);
         _clientOpts = ClientOpts.Create(Opts);
-        HeaderParser = new NatsHeaderParser(opts.HeaderEncoding);
+        HeaderParser = new NatsHeaderParser(opts.HeaderEncoding, opts.CaseSensitiveHeaders);
         _defaultSubscriptionChannelOpts = new BoundedChannelOptions(opts.SubPendingChannelCapacity)
         {
             FullMode = opts.SubPendingChannelFullMode,
@@ -264,11 +264,6 @@ public partial class NatsConnection : INatsConnection
 
                 // Only Closed(initial) state, can run initial connect.
                 await InitialConnectAsync().ConfigureAwait(false);
-
-                if (Opts.RequestReplyMode == NatsRequestReplyMode.Direct)
-                {
-                    await _subscriptionManager.InitializeInboxSubscriptionAsync(_disposedCts.Token).ConfigureAwait(false);
-                }
             }
             catch (NatsException)
             {
@@ -583,6 +578,7 @@ public partial class NatsConnection : INatsConnection
             throw exception;
         }
 
+        string openedUrl;
         lock (_gate)
         {
             var url = _currentConnectUri;
@@ -594,9 +590,16 @@ public partial class NatsConnection : INatsConnection
 #pragma warning disable VSTHRD103
             _initialConnectCts.Cancel();
 #pragma warning restore VSTHRD103
-            _reconnectLoopTask = Task.Run(ReconnectLoop);
-            PushEvent(NatsEvent.ConnectionOpened, new NatsEventArgs(url?.ToString() ?? string.Empty));
+            openedUrl = url?.ToString() ?? string.Empty;
         }
+
+        // Queue the event outside the connection lock: the lock protects the connection state only,
+        // the event channel write must not happen while holding it.
+        PushEvent(NatsEvent.ConnectionOpened, new NatsEventArgs(openedUrl));
+
+        // The reconnect loop is started only after the open event is queued, so a disconnect can
+        // never be reported before the matching open.
+        _reconnectLoopTask = Task.Run(ReconnectLoop);
     }
 
     private async Task ConnectSocketAsync(NatsUri uri)
@@ -747,6 +750,15 @@ public partial class NatsConnection : INatsConnection
 
             // create the socket writer
             CommandWriter.Reset(_socketConnection!);
+
+            // Queue the reply inbox SUB before the connection is reported open. Anything a caller
+            // publishes once released is written to the same pipe after it, so a Direct mode
+            // request cannot reach the server ahead of the subscription for its reply. On a
+            // reconnect the inbox already exists and was replayed above, so this is a no-op.
+            if (Opts.RequestReplyMode == NatsRequestReplyMode.Direct)
+            {
+                await _subscriptionManager.InitializeInboxSubscriptionAsync(_disposedCts.Token).ConfigureAwait(false);
+            }
 
             lock (_gate)
             {
@@ -911,19 +923,29 @@ public partial class NatsConnection : INatsConnection
             }
 
             bool emitReconnect;
+            string openedUrl;
+
+            // OnConnectingAsync may have redirected the connection, so report the URI the socket was opened to.
+            var connectedUri = _currentConnectUri ?? url;
             lock (_gate)
             {
                 _connectRetry = 0;
                 _backoff = TimeSpan.Zero;
-                _logger.LogInformation(NatsLogEvents.Connection, "Connection succeeded {Name}, NATS {Url} [{ReconnectCount}]", _name, url, reconnectCount);
+                _logger.LogInformation(NatsLogEvents.Connection, "Connection succeeded {Name}, NATS {Url} [{ReconnectCount}]", _name, connectedUri, reconnectCount);
                 ConnectionState = NatsConnectionState.Open;
                 emitReconnect = Telemetry.Reconnects.Enabled;
                 _pingTimerCancellationTokenSource = new CancellationTokenSource();
                 StartPingTimer(_pingTimerCancellationTokenSource.Token);
                 _waitForOpenConnection.TrySetResult();
-                _reconnectLoopTask = Task.Run(ReconnectLoop);
-                PushEvent(NatsEvent.ConnectionOpened, new NatsEventArgs(url.ToString()));
+                openedUrl = connectedUri.ToString();
             }
+
+            // Queue the event outside the connection lock (see InitialConnectAsync).
+            PushEvent(NatsEvent.ConnectionOpened, new NatsEventArgs(openedUrl));
+
+            // The next reconnect cycle is started only after the open event is queued, so the
+            // disconnect of the next cycle can never be reported before this open.
+            _reconnectLoopTask = Task.Run(ReconnectLoop);
 
             if (emitReconnect)
                 Telemetry.Reconnects.Add(1, Telemetry.BuildMetricTags(this, Telemetry.Constants.OpReconnect));
@@ -1140,7 +1162,17 @@ public partial class NatsConnection : INatsConnection
                     }
                 }
 
-                await PingOnlyAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await PingOnlyAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (NatsTimeoutException)
+                {
+                    // Couldn't get the PING out (e.g. send buffer full on a dead connection).
+                    // Count it as a missed PONG so MaxPingOut can still abort the connection.
+                    _logger.LogDebug(NatsLogEvents.Connection, "Ping write timed out");
+                }
+
                 await periodicTimer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false);
             }
         }
